@@ -13,6 +13,7 @@
 | 拿到 root shell | ✅ **可以**，走 Web 注入点 |
 | 持久化交互式 shell | ✅ 可以，用 FIFO + 常驻 `sh`，见第 4 节 |
 | 重启后保留改动 | ❌ `/` 是只读 squashfs，`/etc` 走内存 overlay，必回滚 |
+| 关掉自带 WiFi | 运行时 ✅ 立刻生效；**持久化 ❌ 做不到**，见第 7 节 |
 
 一句话总结：**这台设备的 `22/23` 端口在交换芯片层面就被封死了，但它的 Web 服务里藏着一个 root 权限的命令注入点。**
 
@@ -342,7 +343,98 @@ ctapi pon get pon_state   # success
 
 ---
 
-## 7. 快速上手
+## 7. 关掉自带 WiFi：运行时可以，持久化不行
+
+场景很常见：光猫后面接自己的路由器拨号 + 自己的 AP，光猫自带的 2.4G/5G 只是同频干扰源，想关掉。
+
+### 7.1 运行时立刻关掉（有效）
+
+厂商给了一个 `ctapi` 子接口，不需要改任何配置文件：
+
+```bash
+ctapi wl set 24g_radio off
+ctapi wl set 5g_radio off
+```
+
+几秒内 hostapd 退出、信标消失，`wl0.vif` / `wl1.vif` 变为 DOWN：
+
+```bash
+ip netns exec MNG ip link show wl0.vif    # state DOWN
+```
+
+想恢复就 `... on`。键名规律看起来是 `<24g|5g>_<radio|ssid|channel|power|...>`，
+不过本文只实际验证了 `*_radio on/off` 这一对。
+
+### 7.2 但它只改 tmpfs 里的东西
+
+`ctapi wl` 实际改的是 `/tmp/wlan1.conf`、`/tmp/wlan2.conf` —— `/tmp` 是 tmpfs，**重启即失**。
+WiFi 的权威配置在 ovsdb 配置库里：
+
+```bash
+sed -n '4p' /usr/local/db/conf.db | grep -aoE '"WLAN_RADIO":\{.{0,600}'
+```
+
+```
+{"radio_band":"2.4G","radio_mode":"802.11ax","radio_enable":1,"power":1, ...}
+{"radio_band":"5G",  "radio_mode":"802.11ax","radio_enable":1,"power":1, ...}
+```
+
+`WLAN_SSID` 表里对应着 `ssid_name` / `ssid_password` / `ssid_broadcast`。
+**把 `radio_enable` 改成 0 才是持久化的正解** —— 但这台机器上改不动，原因如下。
+
+### 7.3 为什么直接改 `conf.db` 不行
+
+两个障碍，第一个能绕，第二个绕不过：
+
+**① 文件头带长度和校验**
+
+`conf.db` 不是裸 JSON，第一行是 `OVSDB JSON <字节长度> <sha1>`，正文和头必须自洽。
+用 sed 原地替换（`"radio_enable":1` → `:0`）虽然字节长度没变，但 sha1 必然变成对不上的值：
+
+```bash
+head -c 60 /usr/local/db/conf.db
+# OVSDB JSON 173095 6b2c...（长度 + 数据段 sha1）
+```
+
+实测改完后立刻比对：头部声明的 `<len> <sha1>` 已经和新的数据段对不上。按 OVSDB 规范，
+读取方会判定该文件损坏，所以当场从备份恢复、没有再往下试 —— 继续试的代价是管理面异常加
+反复断电重启（本文档前面已经因为别的原因重启过两次），收益只是让 WiFi 静音，不值得。
+理论上可以按这个格式自己重算头（sha1 覆盖数据段），但见第 ②。
+
+**② 内存里的副本会覆盖你的修改**
+
+`cm` 和 `ovsdb-server` 常驻，各自持有这份配置的内存副本，并会在状态变化时**回写整个文件**。
+就算你把静态文件连同校验头改得完美无缺，只要进程还在跑，它的下一次 commit 就会用内存状态覆盖回去；
+而如果你把进程杀掉再改，`cm` 重启后又会走「向云端控制器要配置」的流程重新下发。
+
+**这就是 SDN 网关和传统光猫的根本区别：配置的所有权在云端，本地文件只是缓存。**
+
+### 7.4 试过但走不通的兜底思路
+
+| 思路 | 结果 |
+|---|---|
+| 开机脚本里跑一次 `ctapi wl set ... off` | 写入点只有 `/etc`（内存 overlay）和 `/tmp`，都过不了重启；`/usr/local` `/fhconf` 虽为 ubifs 持久分区，但启动流程不读那里的自定义脚本 |
+| 用 `crond` 定时兜底 | **`crond` 根本没在跑**；`/fhrom/fhshell/crond_start.sh`（其他固件里存在）在本机不存在 |
+| 改 nvram | 本机有 `/bin/nvram` + `kernel_nvram.setting`，但能读到的键都是射频校准参数，没找到对应 `radio_enable` 的键。这条**只做到一半**，因决定终止研究而放弃 |
+| `ubus` / `wlan_mgr_ubus_config` | 都在，但它们是 `wlan_mgr` 的运行期接口，背后读的仍是 ovsdb 那份配置；没找到能改「下次启动是否 enable」的方法 |
+| 改 `/usr/local/db/conf.db` | 见 7.3，校验 + 回写双重障碍 |
+
+### 7.5 结论
+
+**这台设备上「持久化关掉 WiFi」做不到，除非能改云端下发的配置（做不到，也不该做）。**
+
+重启后 WiFi 会自己回来。如果只是不想被干扰，工程上更现实的办法：
+
+- 把自己的 AP 信道挪开，别和光猫重叠（2.4G 只用 1/6/11，5G 避开 DFS 与 149 以上重叠段）
+- 光猫物理上挪远一点，或者塞进弱电箱 —— 金属箱对 2.4G 的衰减很可观
+- 换个不带 WiFi 的纯桥接光猫 / 光模块（本文档第 6 节的参数就是为这个准备的）
+
+> ⚠️ 别尝试 `rm` 掉 `/tmp/wlan*.conf` 或者 `killall hostapd` 了事。前者会被 `wlan_mgr` 重建，
+> 后者会被拉起；两者都只影响运行期，和 `ctapi wl set off` 等价但更容易让 WiFi 进异常状态。
+
+---
+
+## 8. 快速上手
 
 ```bash
 # 1. 确认注入点存在（返回 000 = 固件没有这个洞，直接放弃）
@@ -359,7 +451,7 @@ python onu_console.py
 
 ---
 
-## 8. 免責 / 合规
+## 9. 免責 / 合规
 
 - 本文仅针对**自己拥有或已获授权**的设备。未经授权访问他人网络设备在绝大多数司法辖区都是违法的。
 - 修改 `/etc`、启动服务、写交换芯片寄存器都有变砖风险。`/` 是只读 squashfs，误改根分区可能导致无法启动，只能靠串口或返修恢复。
@@ -368,7 +460,7 @@ python onu_console.py
 
 ---
 
-## 9. 鸣谢
+## 10. 鸣谢
 
 本项目的起点完全来自 **[haoqi366/SDN_research](https://github.com/haoqi366/SDN_research)**。
 
@@ -376,13 +468,15 @@ python onu_console.py
 `sh -c "ctapi sys get secret_iv ;<路径>"`，也是「用 `mkdir $(cmd)` 把 stdout 借 stderr 带出来」
 这一技巧的来源。没有它，本文大概率会停在「22/23 端口打不开、网上教程全不适用」这一步。
 
-本文在其基础上的增量主要有四点：
+本文在其基础上的增量主要有五点：
 
 - 确认该注入点在 **FHQZ.4.0.0（智能随选网关 / SDN 版）** 上依然有效，且**直接就是 root**
 - 逐层定位 **22/23 端口不可达的真正原因**：OVS 表 1 只有 `tp_dst=80` 两条白名单流，
   转发实体在 BCM68560 硬件；并记录了 `ovs-ofctl add-flow` 被 `OFPBRC_BAD_TYPE` 拒绝这一关键负面结果
 - 把一次性命令通道改造成**持久化交互式 shell**（`exec 9<>` 持有 FIFO，避免读端收到 EOF）
 - 补上该机型的**网络架构 dump**（命名空间 / VLAN-MAC 派生 / 控制器），供换光猫时对照
+- 划清「关掉自带 WiFi」的边界：运行时 `ctapi wl set ... off` 有效，但配置所有权在云端 ovsdb，
+  `conf.db` 带 `OVSDB JSON <len> <sha1>` 头校验且会被常驻进程回写 —— **持久化不可行**（第 7 节）
 
 原仓库的许可条款请以其仓库内声明为准。
 
@@ -393,7 +487,7 @@ python onu_console.py
 
 ---
 
-## 10. 文件说明
+## 11. 文件说明
 
 | 文件 | 说明 |
 |---|---|

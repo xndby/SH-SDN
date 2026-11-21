@@ -299,7 +299,46 @@ table=1 priority=125 tcp,nw_src=192.168.1.1,nw_dst=192.168.1.0/24,tp_src=80 → 
 table=4 in_port=1..12 → output:100   (100 = CPU 口)
 ```
 
-## 10. 换光猫时的对照清单
+## 10. WiFi（配置位置与关闭边界）
+
+两个射频，2.4G + 5G，802.11ax。SSID 与预共享密钥在 `WLAN_SSID` 表，开关在 `WLAN_RADIO` 表，
+都是 ovsdb 里的结构：
+
+```bash
+sed -n '4p' /usr/local/db/conf.db | grep -aoE '"WLAN_(SSID|RADIO)":\{.{0,600}'
+```
+
+```
+"WLAN_RADIO":{
+  "…":{"radio_band":"2.4G","radio_mode":"802.11ax","radio_enable":1,"power":1,"wlan_ssids":["uuid","…"]},
+  "…":{"radio_band":"5G",  "radio_mode":"802.11ax","radio_enable":1,"power":1,"bandwidth":1,"wlan_ssids":["uuid","…"]}
+}
+"WLAN_SSID":{
+  "…":{"ssid_name":"ChinaNet-XXXX",   "ssid_password":"<已隐去>","ssid_encryt_type":"WPA-PSK/WPA2-PSK","ssid_broadcast":1},
+  "…":{"ssid_name":"ChinaNet-XXXX-5G","ssid_password":"<已隐去>","ssid_encryt_type":"WPA-PSK/WPA2-PSK","ssid_broadcast":1,"ssid_index":8}
+}
+```
+
+运行时配置分别落在 `/var/wl0_hapd.conf`、`/var/wl1_hapd.conf`（hostapd，`hw_mode=g` / `a`，`wpa=3`），
+以及 `/tmp/wlan1.conf`、`/tmp/wlan2.conf`（tmpfs，重启即失）。
+
+### 关 WiFi：运行时能做，持久化做不到
+
+```bash
+ctapi wl set 24g_radio off
+ctapi wl set 5g_radio off
+```
+
+立刻生效，`wl0.vif` / `wl1.vif` 转 DOWN。但权威开关是 `WLAN_RADIO.radio_enable`，
+而它改不动 —— 原因见 README 第 7 节：
+
+1. `conf.db` 头部是 `OVSDB JSON <字节长度> <sha1>`，改了正文必须重算头，否则 `cm` 加载失败；
+2. 更关键的是 `cm` / `ovsdb-server` 内存里持有副本并会回写整个文件，**配置所有权在云端控制器**。
+
+`crond` 未运行，`/fhrom/fhshell/crond_start.sh` 不存在，所以也没有「开机后跑一次」的兜底。
+结论：**重启后 WiFi 一定会回来**，本地无解。
+
+## 11. 换光猫时的对照清单
 
 换成自己的光猫 / 光模块之前，逐条确认：
 
@@ -313,6 +352,7 @@ table=4 in_port=1..12 → output:100   (100 = CPU 口)
 - [ ] MAC 若被绑定，按 `base` / `base+2` / `base+4` / `base+5` 逐项派生
 - [ ] DNS 可填 `15.192.252.188` / `15.192.251.188`
 - [ ] 管理 VLAN 46（只影响 TR-069 远程管理，不影响上网）
+- [ ] 新猫若自带 WiFi 且用自有 AP，注意避开同频；原机无法持久关闭自带 WiFi（见上一节）
 
 > ⚠️ 各地电信 VLAN 规划并不统一，上表是**上海**实测结果。换机前建议先用原机
 > `tcpdump` 或局端工单确认本地实际 VLAN。
