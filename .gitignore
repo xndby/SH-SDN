@@ -1,0 +1,6 @@
+# 本地采集的原始 dump（含真实 LOID / SN / MAC，切勿提交）
+onu_dump/
+HG5143F-LOID记录.md
+*.log
+__pycache__/
+*.pyc
