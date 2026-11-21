@@ -304,7 +304,14 @@ ip netns list
 
 基础 MAC 在 `/var/run/base_mac`。各业务 MAC 由此递增派生 —— **部分局端按 MAC 做绑定，换猫时要照着配。**
 
-> 注意：实际 VLAN 值由云端控制器运行时下发（`create_WAN.sh` 的 `$vlanid` 参数），上表是默认映射关系。上海地区管理 VLAN 固定 46。
+> ⚠️ 上面的 VLAN 值来自源码注释，属于「设计意图」。**运行时真值已另外实测确认**，
+> 见 [docs/network-dump.md](docs/network-dump.md) 第 6 节：从 ovsdb 的 `WANConnection`
+> 表读出 `bridge0 → vlan 0`、`iptv.85 → vlan 85`、`iptv.51 → vlan 51`，并实测验证了
+> MAC 的 +4 / +5 派生关系。
+>
+> 一个反直觉的结论：**这台设备上网不是 PPPoE，是 IPoE + VLAN 0 不打标签。**
+> `/etc/ppp` 不存在、`create_WAN.sh` 里 PPPoE 分支只有 `#TODO` 占位。
+> 所以「换光猫要抄宽带账号密码」在这条线路上并不成立 —— 设备里没有这个凭据。
 
 ### 6.3 控制器与 DNS
 
