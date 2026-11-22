@@ -25,6 +25,9 @@
 
 > 这批参数不是猜的：VLAN 0、IPTV 85/51、管理 46、PON 制式，都是在原猫上实测 dump 出来的，
 > 见 [../hg5143f/network-dump.md](../hg5143f/network-dump.md)。
+>
+> 参数区（flash TagParam）的完整 ID 索引 —— 哪个 Tag ID 对应 LOID / SN / MAC / SSID，
+> 换机时到底该改哪 6 项 —— 见 [docs/tagparam-map.md](docs/tagparam-map.md)。
 
 ---
 

@@ -86,12 +86,23 @@ onu_backup/              # 分区镜像 + DEVICE-PARAMS.md（含明文 LOID/SN/M
 ## 5. 提交前自检
 
 ```bash
-# 在本仓库根目录跑，应该零命中
-grep -rniE "0{0,1}033936746|loid\s*[:=]\s*[0-9]{8,}" . --include="*.md" --include="*.py"
-grep -rnE "([0-9A-F]{2}:){5}[0-9A-F]{2}" . --include="*.md" | grep -v "XX:XX:XX"
-grep -rnE "\b[0-9A-F]{20}\b" . --include="*.md"
-grep -rnE "^[^#]*\b[0-9A-F]{12}\b" . --include="*.py"   # 疑似 12 位 Telnet 密码
+# 在本仓库根目录跑，全部应该零命中
+
+# 1) LOID：loid / PONLOID / 2180 附近出现 8 位以上连续数字
+grep -rniE "(loid|2180)[^\n]{0,24}[0-9]{8,}" . --include="*.md" --include="*.py"
+
+# 2) MAC：六组两位十六进制以冒号分隔（排除已打码的 XX 形式）
+grep -rnE "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}" . --include="*.md" | grep -vi "xx:xx"
+
+# 3) SN 后缀：16 位以上连续十六进制
+grep -rnE "\b[0-9A-Fa-f]{16,}\b" . --include="*.md"
+
+# 4) Telnet 密码：脚本里出现的 12 位十六进制字面量
+grep -rnE "\b[0-9A-Fa-f]{12}\b" . --include="*.py"
 ```
+
+> 写规则时别把真值当示例：自检命令本身如果贴了真实 LOID 的片段，就等于没脱敏。
+> 用「结构特征」（位数、字符集、出现位置）描述，不要用值。
 
 ---
 

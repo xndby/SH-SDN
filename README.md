@@ -99,6 +99,8 @@
 │   └── onu_console.py         ← 持久化交互式 shell
 ├── f7015tv3/                  ← 新猫：换机手册
 │   ├── README.md              ← 开 Telnet → 备份 → 改区 → 写 LOID → 屏蔽 ITMS
+│   ├── docs/
+│   │   └── tagparam-map.md    ← TagParam 参数区索引（哪个 ID 是什么，换机改哪些）
 │   └── tools/
 │       ├── read_optical.py        ← 光功率采样与 dBm 换算
 │       ├── onu_telnet_admin.py    ← Telnet 密码试错 / dump TelnetCfg / 改密码
