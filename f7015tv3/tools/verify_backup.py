@@ -17,7 +17,8 @@ import struct
 import sys
 import zlib
 
-BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "onu_backup")
+BACKUP_DIR = os.environ.get("F7_BACKUP_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "onu_backup")
 
 # ⚠️ 下面的分区尺寸仅供参考，务必先用 `cat /proc/mtd` 核对后再判定 FAIL。
 #    已知历史问题：mtd12 / mtd13 这两项曾在早期版本里被写反过；
@@ -201,6 +202,14 @@ CHECKERS = {"elf": check_elf, "squashfs": check_squashfs, "ubi": check_ubi,
 
 
 def main():
+    global BACKUP_DIR
+    # 用法: verify_backup.py [备份目录]   或   F7_BACKUP_DIR=/path/to/onu_backup
+    if len(sys.argv) > 1:
+        BACKUP_DIR = os.path.abspath(sys.argv[1])
+    if not os.path.isdir(BACKUP_DIR):
+        sys.exit(f"[X] 备份目录不存在: {BACKUP_DIR}\n"
+                 f"    用法: {os.path.basename(sys.argv[0])} <onu_backup 目录>")
+
     sums = {}
     sp = os.path.join(BACKUP_DIR, "SHA256SUMS.txt")
     for line in open(sp, encoding="utf-8"):

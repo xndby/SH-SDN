@@ -79,9 +79,13 @@ python scripts/zte_webfac_v3.py auto -u telecomadmin -p 'nE7jA%5m'
 ### 3.2 全分区备份
 
 ```bash
+# 下面两个 scripts/ 是第三方仓库里的（见 3.1 的 clone 说明），不是本仓库的
 python scripts/tftp_server.py            # 用能过防火墙的解释器启动
 python scripts/backup_mtd_all.py         # 13 个 mtd + cspd.bin，约 27 分钟
-python tools/verify_backup.py            # 离线校验：尺寸 + SHA256 + 格式级 CRC
+
+# 离线校验（本仓库自带）
+python tools/verify_backup.py <onu_backup 目录>
+# 也可以：F7_BACKUP_DIR=/path/to/onu_backup python tools/verify_backup.py
 ```
 
 ### 3.3 改区域码
@@ -261,7 +265,8 @@ cp -f /etc/db_default_<省>_cfg.xml  →  /userconfig/cfg/db_default_cfg.xml
 **回滚要点**
 
 - 恢复用 U 盘/TFTP + `mtd write`，注意分区名对应关系，写前先 `cat /proc/mtd` 核对。
-- [`tools/verify_backup.py`](tools/verify_backup.py) 可离线校验镜像完整性，恢复前先跑一遍。
+- [`tools/verify_backup.py`](tools/verify_backup.py) 可离线校验镜像完整性（尺寸 + SHA256 + 格式级 CRC），
+  恢复前先跑一遍：`python tools/verify_backup.py <onu_backup 目录>`
 - 已知不可逆点：`sdefconf` 恢复出厂后，原厂个性化配置（如旧区域码相关模板）只能靠备份还原。
 
 ---
