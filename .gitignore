@@ -1,6 +1,17 @@
-# 本地采集的原始 dump（含真实 LOID / SN / MAC，切勿提交）
+# ── 含真实 LOID / SN / MAC 的本地产物，切勿提交 ──
 onu_dump/
+onu_backup/
 HG5143F-LOID记录.md
+*.local.md
+DEVICE-PARAMS.md
+tagparam_raw_dump.txt
+
+# ── 第三方仓库，按需自行 clone，不入库 ──
+zte-f7015tv3-telnet-solidify/
+
+# ── 常规 ──
 *.log
 __pycache__/
 *.pyc
+.venv/
+venv/

